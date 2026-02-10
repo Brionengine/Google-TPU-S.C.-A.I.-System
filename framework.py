@@ -177,7 +177,7 @@ class ASICCommanderAI:
     - Performance history with trend analysis
     """
 
-    VERSION = "2.0.0"
+    VERSION = "2.0.4"
 
     def __init__(self, nodes: List[ComputeNode] = None, scheduler: TPUWorkloadScheduler = None):
         self.nodes = nodes or []
