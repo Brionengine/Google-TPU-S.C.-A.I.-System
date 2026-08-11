@@ -112,11 +112,49 @@ class TPUWorkloadScheduler:
     def __init__(self, allocations: List[TPUAllocation] = None):
         self.allocations = allocations or TRC_ALLOCATIONS
         self.job_queue: deque = deque()
+        self.running_jobs: Dict[int, Dict] = {}
         self.completed_jobs: List[Dict] = []
         self.job_counter = 0
 
+        # Chips currently committed per allocation, keyed by allocation identity.
+        # Scheduling previously compared a request against an allocation's total
+        # chip count and never decremented anything, so the same 64 chips could
+        # be handed to an unlimited number of jobs at once.
+        self._in_use: Dict[int, int] = {id(a): 0 for a in self.allocations}
+
+    # -- Capacity -----------------------------------------------------------
+
+    def available_chips(self, allocation: TPUAllocation) -> int:
+        """Chips in this allocation not currently committed to a job."""
+        return allocation.chip_count - self._in_use.get(id(allocation), 0)
+
+    def capacity_report(self) -> List[Dict[str, Any]]:
+        """Per-allocation capacity and utilization."""
+        report = []
+        for a in self.allocations:
+            used = self._in_use.get(id(a), 0)
+            report.append({
+                'zone': a.zone,
+                'chip_type': a.chip_type,
+                'total_chips': a.chip_count,
+                'chips_in_use': used,
+                'chips_available': a.chip_count - used,
+                'utilization': used / a.chip_count if a.chip_count else 0.0,
+            })
+        return report
+
+    # -- Job lifecycle ------------------------------------------------------
+
     def submit_job(self, job_type: str, required_chips: int, preferred_chip: str = 'v6e') -> Dict:
-        """Submit a compute job to the scheduler."""
+        """
+        Submit a compute job.
+
+        A job that cannot be placed right now stays queued rather than being
+        reported as scheduled, and is retried whenever capacity is released.
+        """
+        if required_chips <= 0:
+            raise ValueError("required_chips must be positive")
+
         self.job_counter += 1
         job = {
             'id': self.job_counter,
@@ -126,40 +164,107 @@ class TPUWorkloadScheduler:
             'status': 'queued',
             'submitted_at': time.time(),
             'assigned_zone': None,
+            'assigned_chip': None,
         }
-        # Find best allocation
-        best = self._find_best_allocation(required_chips, preferred_chip)
-        if best:
-            job['assigned_zone'] = best.zone
-            job['assigned_chip'] = best.chip_type
-            job['status'] = 'scheduled'
-            logger.info(f"Job {job['id']} scheduled on {best.chip_type} in {best.zone}")
-        else:
-            logger.warning(f"Job {job['id']} queued - no suitable allocation found")
-        self.job_queue.append(job)
+
+        if not self._place(job):
+            self.job_queue.append(job)
+            logger.warning(
+                f"Job {job['id']} queued - no allocation with "
+                f"{required_chips} free chips"
+            )
         return job
 
+    def complete_job(self, job_id: int) -> Optional[Dict]:
+        """
+        Mark a running job finished, releasing its chips.
+
+        Freed capacity is immediately offered to queued jobs, so a queue that
+        was blocked on capacity drains without another submit.
+        """
+        job = self.running_jobs.pop(job_id, None)
+        if job is None:
+            return None
+
+        allocation = job.pop('_allocation', None)
+        if allocation is not None:
+            key = id(allocation)
+            self._in_use[key] = max(0, self._in_use.get(key, 0) - job['required_chips'])
+
+        job['status'] = 'completed'
+        job['completed_at'] = time.time()
+        job['duration'] = job['completed_at'] - job['submitted_at']
+        self.completed_jobs.append(job)
+
+        self._drain_queue()
+        return job
+
+    def _drain_queue(self) -> List[Dict]:
+        """Place as many queued jobs as freed capacity now allows, in order."""
+        placed, deferred = [], []
+        while self.job_queue:
+            job = self.job_queue.popleft()
+            if self._place(job):
+                placed.append(job)
+            else:
+                deferred.append(job)
+        # Preserve submission order for everything still unplaceable.
+        self.job_queue.extend(deferred)
+        return placed
+
+    def _place(self, job: Dict) -> bool:
+        """Commit a job to the best allocation with room, if any."""
+        allocation = self._find_best_allocation(
+            job['required_chips'], job['preferred_chip']
+        )
+        if allocation is None:
+            return False
+
+        self._in_use[id(allocation)] = (
+            self._in_use.get(id(allocation), 0) + job['required_chips']
+        )
+        job['assigned_zone'] = allocation.zone
+        job['assigned_chip'] = allocation.chip_type
+        job['status'] = 'scheduled'
+        job['scheduled_at'] = time.time()
+        job['_allocation'] = allocation
+        self.running_jobs[job['id']] = job
+        logger.info(
+            f"Job {job['id']} scheduled on {allocation.chip_type} in {allocation.zone}"
+        )
+        return True
+
     def _find_best_allocation(self, required_chips: int, preferred_chip: str) -> Optional[TPUAllocation]:
-        """Find the best TPU allocation for a job."""
-        candidates = [a for a in self.allocations if a.chip_count >= required_chips]
-        # Prefer matching chip type
+        """
+        Best allocation with enough *free* chips.
+
+        Ties break toward the allocation with the least spare capacity, so a
+        small job does not consume the one zone large enough for a big one.
+        """
+        candidates = [a for a in self.allocations
+                      if self.available_chips(a) >= required_chips]
+        if not candidates:
+            return None
+
         preferred = [a for a in candidates if a.chip_type == preferred_chip]
-        if preferred:
-            return max(preferred, key=lambda a: a.total_tflops)
-        if candidates:
-            return max(candidates, key=lambda a: a.total_tflops)
-        return None
+        pool = preferred or candidates
+        return min(pool, key=lambda a: (self.available_chips(a), -a.flops_per_chip))
 
     def get_total_compute(self) -> Dict[str, Any]:
         """Get total compute capacity across all allocations."""
         total_chips = sum(a.chip_count for a in self.allocations)
         total_tflops = sum(a.total_tflops for a in self.allocations)
+        chips_in_use = sum(self._in_use.values())
         return {
             'total_chips': total_chips,
+            'chips_in_use': chips_in_use,
+            'chips_available': total_chips - chips_in_use,
+            'utilization': chips_in_use / total_chips if total_chips else 0.0,
             'total_tflops': total_tflops,
             'total_pflops': total_tflops / 1000,
             'allocations': len(self.allocations),
             'jobs_queued': len(self.job_queue),
+            'jobs_running': len(self.running_jobs),
             'jobs_completed': len(self.completed_jobs),
         }
 
